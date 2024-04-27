@@ -332,6 +332,18 @@ func (c *Cmd) Stop() error {
 	return terminateProcess(c.status.PID)
 }
 
+func (c *Cmd) Kill() error {
+	c.Lock()
+	defer c.Unlock()
+
+	err := c.LowCommand.Process.Kill()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Status returns the Status of the command at any time. It is safe to call
 // concurrently by multiple goroutines.
 //
