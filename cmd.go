@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -83,6 +84,9 @@ type Cmd struct {
 
 	// Stderr sets streaming STDERR if enabled, else nil (see Options).
 	Stderr chan string
+
+	//Golang Actual command
+	LowCommand *exec.Cmd
 
 	*sync.Mutex
 	started         bool      // cmd.Start called, no error
@@ -321,6 +325,10 @@ func (c *Cmd) Stop() error {
 	// Signal the process group (-pid), not just the process, so that the process
 	// and all its children are signaled. Else, child procs can keep running and
 	// keep the stdout/stderr fd open and cause cmd.Wait to hang.
+	err := c.LowCommand.Process.Signal(os.Kill)
+	if err != nil {
+		return err
+	}
 	return terminateProcess(c.status.PID)
 }
 
@@ -365,7 +373,7 @@ func (c *Cmd) Status() Status {
 		}
 	} else {
 		// Still running
-		c.status.Runtime = time.Now().Sub(c.startTime).Seconds()
+		c.status.Runtime = time.Since(c.startTime).Seconds()
 		if c.stdoutBuf != nil {
 			c.status.Stdout = c.stdoutBuf.Lines()
 
@@ -396,36 +404,36 @@ func (c *Cmd) run(in io.Reader) {
 	// //////////////////////////////////////////////////////////////////////
 	// Setup command
 	// //////////////////////////////////////////////////////////////////////
-	cmd := exec.Command(c.Name, c.Args...)
+	c.LowCommand = exec.Command(c.Name, c.Args...)
 	if in != nil {
-		cmd.Stdin = in
+		c.LowCommand.Stdin = in
 	}
 
 	// Platform-specific SysProcAttr management
-	setProcessGroupID(cmd)
+	setProcessGroupID(c.LowCommand)
 
 	// Set exec.Cmd.Stdout and .Stderr to our concurrent-safe stdout/stderr
 	// buffer, stream both, or neither
 	switch {
 
 	case c.stdoutBuf != nil && c.stderrBuf != nil && c.stdoutStream != nil: // buffer and stream
-		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
+		c.LowCommand.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+		c.LowCommand.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
 	case c.stdoutBuf != nil && c.stderrBuf == nil && c.stdoutStream != nil: // combined buffer and stream
-		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
+		c.LowCommand.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+		c.LowCommand.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
 	case c.stdoutBuf != nil && c.stderrBuf != nil: // buffer only
-		cmd.Stdout = c.stdoutBuf
-		cmd.Stderr = c.stderrBuf
+		c.LowCommand.Stdout = c.stdoutBuf
+		c.LowCommand.Stderr = c.stderrBuf
 	case c.stdoutBuf != nil && c.stderrBuf == nil: // buffer combining stderr into stdout
-		cmd.Stdout = c.stdoutBuf
-		cmd.Stderr = c.stdoutBuf
+		c.LowCommand.Stdout = c.stdoutBuf
+		c.LowCommand.Stderr = c.stdoutBuf
 	case c.stdoutStream != nil: // stream only
-		cmd.Stdout = c.stdoutStream
-		cmd.Stderr = c.stderrStream
+		c.LowCommand.Stdout = c.stdoutStream
+		c.LowCommand.Stderr = c.stderrStream
 	default: // no output (cmd >/dev/null 2>&1)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
+		c.LowCommand.Stdout = nil
+		c.LowCommand.Stderr = nil
 	}
 
 	// Always close output streams. Do not do this after Wait because if Start
@@ -448,19 +456,19 @@ func (c *Cmd) run(in io.Reader) {
 
 	// Set the runtime environment for the command as per os/exec.Cmd.  If Env
 	// is nil, use the current process' environment.
-	cmd.Env = c.Env
-	cmd.Dir = c.Dir
+	c.LowCommand.Env = c.Env
+	c.LowCommand.Dir = c.Dir
 
 	// Run all optional commands to customize underlying os/exe.Cmd.
 	for _, f := range c.beforeExecFuncs {
-		f(cmd)
+		f(c.LowCommand)
 	}
 
 	// //////////////////////////////////////////////////////////////////////
 	// Start command
 	// //////////////////////////////////////////////////////////////////////
 	now := time.Now()
-	if err := cmd.Start(); err != nil {
+	if err := c.LowCommand.Start(); err != nil {
 		c.Lock()
 		c.status.Error = err
 		c.status.StartTs = now.UnixNano()
@@ -472,8 +480,8 @@ func (c *Cmd) run(in io.Reader) {
 
 	// Set initial status
 	c.Lock()
-	c.startTime = now              // command is running
-	c.status.PID = cmd.Process.Pid // command is running
+	c.startTime = now                       // command is running
+	c.status.PID = c.LowCommand.Process.Pid // command is running
 	c.status.StartTs = now.UnixNano()
 	c.started = true
 	c.Unlock()
@@ -481,7 +489,7 @@ func (c *Cmd) run(in io.Reader) {
 	// //////////////////////////////////////////////////////////////////////
 	// Wait for command to finish or be killed
 	// //////////////////////////////////////////////////////////////////////
-	err := cmd.Wait()
+	err := c.LowCommand.Wait()
 	now = time.Now()
 
 	// Get exit code of the command. According to the manual, Wait() returns:
